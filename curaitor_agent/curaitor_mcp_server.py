@@ -6,36 +6,45 @@
 import arxiv
 import json
 import os
-from typing import List
+from typing import Iterable, List
 from mcp.server.fastmcp import FastMCP
 # from arxiv_search_chunk import download_arxiv_pdfs
 # from arxiv_search_chunk import get_keywords_from_llm
 import yaml
 import subprocess
-import numpy as np
 from pathlib import Path
 import importlib.util
 import requests
 import time as time_module
 from dateutil import tz
 from datetime import datetime, timedelta, timezone, time
-from typing import List, Optional
+from typing import Optional
 import tiktoken
-import numpy as np
 import faiss
 from collections import defaultdict
 from io import BytesIO
-from pypdf import PdfReader
 from mcp.server.fastmcp.prompts.base import Message
 from mcp.types import TextContent
 from gmail_send import gmail_send
 import logging
+import numpy as np
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from scheduler_service import (
     schedule_daily_job,
     remove_job,
     list_jobs,
     get_scheduler,  # optional: to ensure scheduler is initialized on demand
+)
+# Local PDF ingestion helpers
+from pdf_repository import (
+    DEFAULT_DB_PATH,
+    DocumentChunk,
+    collect_documents_from_directory,
+    embed_texts,
+    fetch_document_chunks,
+    list_stored_documents,
+    parse_pdf_file,
+    store_documents,
 )
 # import argparse
 
@@ -50,6 +59,48 @@ config = yaml.safe_load(open("config.yaml", "r", encoding="utf-8"))
 # print(config['llm'][1]['model'])
 provider = config['llm'][0]['provider']
 raw_model = config['llm'][1]['model']
+
+
+def _get_config_value(section: str, key: str, default=None):
+    data = config.get(section, {})
+    if isinstance(data, dict):
+        return data.get(key, default)
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and key in item:
+                return item[key]
+    return default
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _store_documents_with_defaults(documents: Iterable) -> tuple[Optional[str], Optional[str]]:
+    docs = list(documents)
+    if not docs:
+        return None, None
+
+    chunk_size = _as_int(_get_config_value("rag", "chunk_size", 1000), 1000)
+    chunk_overlap = _as_int(_get_config_value("rag", "overlap", 100), 100)
+    embedding_model_name = _get_config_value("rag", "embedding_model", None)
+    embedding_prefix = _get_config_value("rag", "embedding_prefix", None)
+
+    if embedding_prefix is None and embedding_model_name:
+        embedding_prefix = "search_document: "
+
+    store_documents(
+        docs,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        embedding_model=embedding_model_name,
+        embedding_prefix=embedding_prefix if embedding_model_name else None,
+    )
+
+    return embedding_model_name, embedding_prefix if embedding_model_name else None
 
 if provider == 'openrouter':
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -561,7 +612,7 @@ def search_arxiv_titles_only(
         return {"papers": papers, "query": QUERY, "count": len(papers)}
         
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
 @mcp.tool()
 def download_specific_papers(paper_urls: list[str]) -> dict:
@@ -590,7 +641,7 @@ def download_specific_papers(paper_urls: list[str]) -> dict:
         return {"downloaded": downloaded, "success_count": sum(1 for d in downloaded if d["status"] == "success")}
         
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
 # Add these helper functions after the existing functions
 
@@ -1109,36 +1160,52 @@ def list_downloaded_pdfs(pdf_directory: str = None) -> dict:
             return {"error": f"Directory {pdf_dir} does not exist", "pdfs": []}
         
         pdf_files = list(pdf_path.glob("*.pdf"))
-        
+        stored_docs = {rec["path"]: rec for rec in list_stored_documents()}
+
         pdfs = []
         for pdf_file in pdf_files:
             try:
                 # Try to extract arXiv ID from filename
                 arxiv_id = pdf_file.stem.split('.')[0] + '.' + pdf_file.stem.split('.')[1]
                 file_size = pdf_file.stat().st_size
-                
+
+                record = stored_docs.get(str(pdf_file))
                 pdfs.append({
                     "filename": pdf_file.name,
                     "arxiv_id": arxiv_id,
                     "file_size": file_size,
-                    "path": str(pdf_file)
+                    "path": str(pdf_file),
+                    "stored_in_database": bool(record),
+                    "text_length": record.get("text_length") if record else None,
+                    "pages_indexed": record.get("pages_processed") if record else None,
+                    "total_pages": record.get("total_pages") if record else None,
+                    "stored_at": record.get("stored_at") if record else None,
+                    "chunk_count": record.get("chunk_count") if record else None,
                 })
             except Exception:
+                record = stored_docs.get(str(pdf_file))
                 pdfs.append({
                     "filename": pdf_file.name,
                     "arxiv_id": "unknown",
                     "file_size": pdf_file.stat().st_size,
-                    "path": str(pdf_file)
+                    "path": str(pdf_file),
+                    "stored_in_database": bool(record),
+                    "text_length": record.get("text_length") if record else None,
+                    "pages_indexed": record.get("pages_processed") if record else None,
+                    "total_pages": record.get("total_pages") if record else None,
+                    "stored_at": record.get("stored_at") if record else None,
+                    "chunk_count": record.get("chunk_count") if record else None,
                 })
-        
+
         return {
             "pdf_directory": pdf_dir,
             "total_pdfs": len(pdfs),
-            "pdfs": pdfs
+            "pdfs": pdfs,
+            "database_path": str(DEFAULT_DB_PATH),
         }
         
     except Exception as e:
-        return {"error": str(e), "pdfs": []}
+        return {"error": str(e), "pdfs": [], "database_path": str(DEFAULT_DB_PATH)}
 
 # @mcp.tool()
 # def search_and_analyze_papers(
@@ -1243,102 +1310,222 @@ def light_rag_pipeline(
         print(f"[PROGRESS] Processing {len(pdf_files)} PDFs")
         
         # Step 3: Quick text extraction (limited pages)
-        docs = []
-        for pdf_file in pdf_files:
-            try:
-                arxiv_id = pdf_file.stem.replace('v1', '').replace('v2', '').replace('v3', '')
-                
-                # Quick PDF text extraction - limited pages
-                with open(pdf_file, 'rb') as f:
-                    reader = PdfReader(f)
-                    text_parts = []
-                    for i, page in enumerate(reader.pages[:max_pages_per_pdf]):
-                        if i >= max_pages_per_pdf:
-                            break
-                        try:
-                            page_text = page.extract_text()
-                            if page_text and len(page_text.strip()) > 50:
-                                text_parts.append(page_text[:1000])  # Limit text per page
-                        except Exception:
-                            continue
-                    
-                    body_text = "\n".join(text_parts)
-                
-                if body_text.strip():
-                    docs.append({
-                        "arxiv_id": arxiv_id,
-                        "filename": pdf_file.name,
-                        "text": body_text[:3000],  # Hard limit on text length
-                        "path": str(pdf_file)
-                    })
-                
-                print(f"[PROGRESS] Processed {arxiv_id}")
-                
-            except Exception as e:
-                print(f"[WARN] Failed to process {pdf_file}: {e}")
-                continue
-        
-        if not docs:
+        parsed_docs = collect_documents_from_directory(
+            pdf_path,
+            max_pdfs=max_pdfs,
+            max_pages=max_pages_per_pdf,
+            per_page_chars=1000,
+            max_chars=3000,
+        )
+
+        for doc in parsed_docs:
+            print(f"[PROGRESS] Processed {doc.arxiv_id}")
+
+        if not parsed_docs:
             return {"error": "No PDFs could be processed", "keywords": kws}
-        
+
+        # Persist parsed documents for later reuse and embedding-based search.
+        embedding_model_used = _get_config_value("rag", "embedding_model", None)
+        embedding_prefix_used = _get_config_value("rag", "embedding_prefix", None)
+        if embedding_prefix_used is None and embedding_model_used:
+            embedding_prefix_used = "search_document: "
+
+        try:
+            stored_model, stored_prefix = _store_documents_with_defaults(parsed_docs)
+            if stored_model:
+                embedding_model_used = stored_model
+                embedding_prefix_used = stored_prefix
+        except Exception as db_err:
+            print(f"[WARN] Failed to store parsed PDFs: {db_err}")
+
+        docs = [
+            {
+                "arxiv_id": doc.arxiv_id,
+                "filename": doc.filename,
+                "text": doc.text,
+                "path": doc.path,
+                "pages_processed": doc.pages_processed,
+                "total_pages": doc.total_pages,
+            }
+            for doc in parsed_docs
+        ]
+
         print(f"[PROGRESS] Got text from {len(docs)} documents")
-        
-        # Step 4: Simple keyword-based matching (no embeddings)
+
+        stored_docs_records = list_stored_documents()
+        stored_docs = {rec["arxiv_id"]: rec for rec in stored_docs_records}
+
+        query_prefix = _get_config_value("rag", "query_prefix", "search_query: ")
+        top_doc_limit = max(1, _as_int(_get_config_value("rag", "top_k", 5), 5))
+        per_doc_limit = max(1, _as_int(_get_config_value("rag", "per_doc_chunks", 2), 2))
+
+        chunk_hits: list[tuple[str, list[tuple[DocumentChunk, float]]]] = []
+
+        if embedding_model_used:
+            chunks = fetch_document_chunks(embedding_model=embedding_model_used)
+            chunks = [chunk for chunk in chunks if chunk.embedding is not None]
+
+            if chunks:
+                matrix = np.vstack([
+                    np.asarray(chunk.embedding, dtype="float32") for chunk in chunks
+                ])
+                dim = matrix.shape[1]
+                index = faiss.IndexFlatIP(dim)
+                index.add(matrix)
+
+                query_text = f"{query_prefix}{natural_language_query}" if query_prefix else natural_language_query
+                query_vector = embed_texts([query_text], model_name=embedding_model_used)[0]
+                query_vector_np = np.asarray(query_vector, dtype="float32").reshape(1, dim)
+
+                search_k = min(len(chunks), max(top_doc_limit * per_doc_limit * 4, top_doc_limit))
+                distances, indices = index.search(query_vector_np, search_k)
+
+                doc_hits: dict[str, list[tuple[DocumentChunk, float]]] = defaultdict(list)
+                for idx, score in zip(indices[0], distances[0]):
+                    if idx < 0 or idx >= len(chunks):
+                        continue
+                    doc_hits[chunks[idx].arxiv_id].append((chunks[idx], float(score)))
+
+                if doc_hits:
+                    ranked_docs = sorted(
+                        doc_hits.items(),
+                        key=lambda item: max(score for _, score in item[1]),
+                        reverse=True,
+                    )
+                    for doc_id, entries in ranked_docs[:top_doc_limit]:
+                        entries.sort(key=lambda item: item[1], reverse=True)
+                        chunk_hits.append((doc_id, entries[:per_doc_limit]))
+
+        if chunk_hits:
+            context_parts: list[str] = []
+            relevant_papers: list[dict[str, object]] = []
+
+            for doc_id, entries in chunk_hits:
+                metadata = stored_docs.get(doc_id, {})
+                filename = metadata.get("filename") if metadata else None
+                path = metadata.get("path") if metadata else None
+                pages_processed = metadata.get("pages_processed") if metadata else None
+                total_pages = metadata.get("total_pages") if metadata else None
+                chunk_count = metadata.get("chunk_count") if metadata else None
+
+                chunk_details = []
+                best_score = 0.0
+                label = filename or doc_id
+
+                for chunk, score in entries:
+                    best_score = max(best_score, score)
+                    preview = chunk.text[:300] + "..." if len(chunk.text) > 300 else chunk.text
+                    chunk_details.append(
+                        {
+                            "chunk_index": chunk.chunk_index,
+                            "score": score,
+                            "start_char": chunk.start_char,
+                            "end_char": chunk.end_char,
+                            "text_preview": preview,
+                        }
+                    )
+
+                    context_snippet = chunk.text if len(chunk.text) <= 1200 else chunk.text[:1200] + "..."
+                    context_parts.append(
+                        f"[PDF: {label}] (chunk {chunk.chunk_index})\n{context_snippet}"
+                    )
+
+                relevant_papers.append(
+                    {
+                        "filename": filename,
+                        "arxiv_id": doc_id,
+                        "path": path,
+                        "relevance_score": best_score,
+                        "pages_indexed": pages_processed,
+                        "total_pages": total_pages,
+                        "chunk_count": chunk_count,
+                        "chunks": chunk_details,
+                    }
+                )
+
+            context = "\n\n---\n\n".join(context_parts)
+
+            try:
+                answer = answer_query_with_context(natural_language_query, context)
+            except Exception as e:
+                answer = f"Could not generate answer: {e}"
+
+            return {
+                "keywords": kws[:max_keywords],
+                "papers_processed": len(docs),
+                "relevant_papers": relevant_papers,
+                "answer": answer,
+                "retrieval_mode": "embedding",
+                "embedding_model": embedding_model_used,
+                "embedding_prefix": embedding_prefix_used,
+                "query_prefix": query_prefix,
+                "context_chunks": len(context_parts),
+                "stored_documents": len(parsed_docs),
+                "database_path": str(DEFAULT_DB_PATH),
+                "status": "success"
+            }
+
+        # Fallback: keyword-based scoring when embeddings are unavailable
         keyword_lower = [kw.lower() for kw in kws[:max_keywords]]
         scored_docs = []
-        
+
         for doc in docs:
             text_lower = doc["text"].lower()
             score = sum(text_lower.count(kw) for kw in keyword_lower)
             if score > 0:
                 scored_docs.append((doc, score))
-        
-        # Sort by relevance
+
         scored_docs.sort(key=lambda x: x[1], reverse=True)
-        
+
         if not scored_docs:
             return {
                 "keywords": kws[:max_keywords],
                 "papers_processed": len(docs),
                 "relevant_papers": [],
                 "answer": "No relevant content found in the processed PDFs for the given query.",
+                "retrieval_mode": "keyword",
+                "embedding_model": embedding_model_used,
+                "stored_documents": len(parsed_docs),
+                "database_path": str(DEFAULT_DB_PATH),
                 "status": "success"
             }
-        
-        # Step 5: Create simple context and answer
-        top_docs = scored_docs[:3]  # Top 3 most relevant
+
+        top_docs = scored_docs[:3]
         context_parts = []
-        
+
         for doc, score in top_docs:
-            # Extract most relevant snippet
             text = doc["text"]
             snippet = text[:800] + "..." if len(text) > 800 else text
             context_parts.append(f"[PDF: {doc['filename']}]\n{snippet}")
-        
+
         context = "\n\n---\n\n".join(context_parts)
-        
-        # Generate answer
+
         try:
             answer = answer_query_with_context(natural_language_query, context)
         except Exception as e:
             answer = f"Could not generate answer: {e}"
-        
-        # Prepare response
+
         relevant_papers = []
         for doc, score in top_docs:
-            relevant_papers.append({
-                "filename": doc["filename"],
-                "arxiv_id": doc["arxiv_id"],
-                "path": doc["path"],
-                "relevance_score": score,
-                "text_preview": doc["text"][:200] + "..." if len(doc["text"]) > 200 else doc["text"]
-            })
-        
+            relevant_papers.append(
+                {
+                    "filename": doc["filename"],
+                    "arxiv_id": doc["arxiv_id"],
+                    "path": doc["path"],
+                    "relevance_score": score,
+                    "text_preview": doc["text"][:200] + "..." if len(doc["text"]) > 200 else doc["text"]
+                }
+            )
+
         return {
             "keywords": kws[:max_keywords],
             "papers_processed": len(docs),
             "relevant_papers": relevant_papers,
             "answer": answer,
+            "retrieval_mode": "keyword",
+            "embedding_model": embedding_model_used,
+            "stored_documents": len(parsed_docs),
+            "database_path": str(DEFAULT_DB_PATH),
             "status": "success"
         }
         
@@ -1367,6 +1554,7 @@ def quick_pdf_search(
             return {"error": f"Directory {pdf_dir} does not exist"}
         
         pdf_files = list(pdf_path.glob("*.pdf"))[:max_pdfs]
+        stored_docs = {rec["path"]: rec for rec in list_stored_documents()}
         
         # Extract keywords for matching
         kws = get_keywords_from_llm(query) or []
@@ -1377,13 +1565,18 @@ def quick_pdf_search(
             # Score based on filename matching
             filename_lower = pdf_file.name.lower()
             score = sum(1 for kw in keyword_lower if kw in filename_lower)
-            
+
+            record = stored_docs.get(str(pdf_file))
             results.append({
                 "filename": pdf_file.name,
                 "path": str(pdf_file),
                 "size": pdf_file.stat().st_size,
                 "keyword_matches": score,
-                "matched_keywords": [kw for kw in keyword_lower if kw in filename_lower]
+                "matched_keywords": [kw for kw in keyword_lower if kw in filename_lower],
+                "stored_in_database": bool(record),
+                "text_length": record.get("text_length") if record else None,
+                "pages_indexed": record.get("pages_processed") if record else None,
+                "chunk_count": record.get("chunk_count") if record else None,
             })
         
         # Sort by relevance
@@ -1394,11 +1587,12 @@ def quick_pdf_search(
             "keywords": kws[:3],
             "total_pdfs": len(pdf_files),
             "results": results[:10],  # Top 10 matches
+            "database_path": str(DEFAULT_DB_PATH),
             "status": "success"
         }
         
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
 @mcp.tool()
 def extract_pdf_text_only(
@@ -1416,31 +1610,41 @@ def extract_pdf_text_only(
         if not pdf_path.exists():
             return {"error": f"File {pdf_filename} not found in {pdf_dir}"}
         
-        with open(pdf_path, 'rb') as f:
-            reader = PdfReader(f)
-            text_parts = []
-            
-            for i, page in enumerate(reader.pages[:max_pages]):
-                try:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_parts.append(f"--- Page {i+1} ---\n{page_text[:1500]}")
-                except Exception as e:
-                    text_parts.append(f"--- Page {i+1} ---\nError extracting text: {e}")
-            
-            full_text = "\n\n".join(text_parts)
-        
+        parsed = parse_pdf_file(
+            pdf_path,
+            max_pages=max_pages,
+            per_page_chars=1500,
+            max_chars=(max_pages * 1500) if max_pages else None,
+            include_page_headers=True,
+        )
+
+        if parsed is None:
+            return {
+                "error": f"Could not extract text from {pdf_filename}",
+                "database_path": str(DEFAULT_DB_PATH),
+            }
+
+        stored = False
+        try:
+            _store_documents_with_defaults([parsed])
+            stored = True
+        except Exception as db_err:
+            print(f"[WARN] Failed to store {pdf_filename} in database: {db_err}")
+
         return {
-            "filename": pdf_filename,
-            "pages_processed": min(len(reader.pages), max_pages),
-            "total_pages": len(reader.pages),
-            "text": full_text,
-            "text_length": len(full_text),
+            "filename": parsed.filename,
+            "arxiv_id": parsed.arxiv_id,
+            "pages_processed": parsed.pages_processed,
+            "total_pages": parsed.total_pages,
+            "text": parsed.text,
+            "text_length": len(parsed.text),
+            "stored_in_database": stored,
+            "database_path": str(DEFAULT_DB_PATH),
             "status": "success"
         }
-        
+
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
 @mcp.tool()
 def simple_qa_from_text(
