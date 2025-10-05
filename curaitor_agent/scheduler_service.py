@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable, Sequence
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -133,14 +133,20 @@ def schedule_daily_job(
     minute: int,
     job_id: str = "daily_my_job",
     replace_existing: bool = True,
+    job_func: Optional[Callable[..., object]] = None,
+    *,
+    args: Optional[Sequence[object]] = None,
+    kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     scheduler = get_scheduler()
     trigger = CronTrigger(hour=hour, minute=minute)  # uses scheduler's timezone
     scheduler.add_job(
-        my_job,
+        job_func or my_job,
         trigger=trigger,
         id=job_id,
         replace_existing=replace_existing,
+        args=list(args) if args else None,
+        kwargs=dict(kwargs) if kwargs else None,
     )
     logging.getLogger("scheduler").info(
         "Scheduled job '%s' daily at %02d:%02d", job_id, hour, minute
@@ -152,6 +158,64 @@ def schedule_daily_job(
         "hour": hour,
         "minute": minute,
     }
+
+
+def refresh_arxiv_feed_job(
+    query: str,
+    *,
+    max_results: int = 3,
+    pdf_directory: Optional[str] = None,
+    notify_email: Optional[str] = None,
+    max_pages: int = 5,
+) -> Dict[str, Any]:
+    """Job wrapper around ``curaitor_mcp_server.refresh_arxiv_feed``."""
+
+    import curaitor_mcp_server
+
+    result = curaitor_mcp_server.refresh_arxiv_feed(
+        natural_language_query=query,
+        max_results=max_results,
+        pdf_directory=pdf_directory,
+        notify_email=notify_email,
+        max_pages=max_pages,
+    )
+
+    logging.getLogger("scheduler.job").info(
+        "Refresh arXiv feed completed: stored=%s downloads=%s",
+        result.get("stored_count"),
+        result.get("downloads", {}).get("success_count") if isinstance(result.get("downloads"), dict) else None,
+    )
+    return result
+
+
+def schedule_daily_feed_refresh(
+    hour: int,
+    minute: int,
+    *,
+    query: str,
+    max_results: int = 3,
+    pdf_directory: Optional[str] = None,
+    notify_email: Optional[str] = None,
+    max_pages: int = 5,
+    job_id: str = "daily_refresh_arxiv",
+    replace_existing: bool = True,
+) -> Dict[str, Any]:
+    """Schedule the automated arXiv refresh job."""
+
+    return schedule_daily_job(
+        hour,
+        minute,
+        job_id=job_id,
+        replace_existing=replace_existing,
+        job_func=refresh_arxiv_feed_job,
+        kwargs={
+            "query": query,
+            "max_results": max_results,
+            "pdf_directory": pdf_directory,
+            "notify_email": notify_email,
+            "max_pages": max_pages,
+        },
+    )
 
 def remove_job(job_id: str) -> Dict[str, Any]:
     scheduler = get_scheduler()

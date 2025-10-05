@@ -4,6 +4,7 @@
 
 import os
 import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from google.adk.agents import Agent
 # from google.adk.agents import LlmAgent
@@ -104,42 +105,44 @@ elif provider == "openrouter":
 else:
     raise ValueError(f"Unsupported provider for ADK: {provider}")
 
-# MCP toolset
+PROMPT_DIR = Path(__file__).with_name("prompts")
+TOOL_REFERENCE_PATH = PROMPT_DIR / "curaitor_tools.md"
+
+try:
+    TOOL_REFERENCE = TOOL_REFERENCE_PATH.read_text(encoding="utf-8").strip()
+except FileNotFoundError:
+    TOOL_REFERENCE = ""
+
 mcp_toolset = MCPToolset(
     connection_params=StdioConnectionParams(
-        # test/ mock-up functions
         server_params=StdioServerParameters(
             command="uv",
             args=["run", "curaitor_agent/mcp_server.py"],
             env=os.environ.copy(),
         ),
-        # server for sending messages
-        # server schedule tracker
     ),
-    # optional: only expose specific tools
-    # tool_filter=["my_tool_a", "my_tool_b"],
-    # increase timeouts to tolerate slower startup/responses
-    # startup_timeout_seconds=30,   # handshake/init
-    # request_timeout_seconds=60,   # individual request (initialize, list_tools, etc.)
 )
 
-data_initializer_mcp = MCPToolset(
+curaitor_toolset = MCPToolset(
     connection_params=StdioConnectionParams(
-        # test/ mock-up functions
         server_params=StdioServerParameters(
             command="uv",
             args=["run", "curaitor_agent/curaitor_mcp_server.py"],
             env=os.environ.copy(),
         ),
-        # server for sending messages
-        # server schedule tracker
     ),
-    # optional: only expose specific tools
-    # tool_filter=["my_tool_a", "my_tool_b"],
-        # increase timeouts to tolerate slower startup/responses
-    # startup_timeout_seconds=30,   # handshake/init
-    # request_timeout_seconds=60,   # individual request (initialize, list_tools, etc.)
 )
+
+base_instruction = (
+    "You are an intelligent assistant capable of using external tools via MCP. "
+    "Coordinate literature discovery, ingestion, retrieval-augmented chat, and notifications "
+    "by planning thoughtful tool calls."
+)
+
+if TOOL_REFERENCE:
+    agent_instruction = base_instruction + "\n\nTool reference:\n" + TOOL_REFERENCE
+else:
+    agent_instruction = base_instruction
 
 root_agent = Agent(
     name="literature_agent",
@@ -147,8 +150,6 @@ root_agent = Agent(
     description=(
         "Agent to track and summarize literature."
     ),
-    instruction=(
-        "You are an intelligent assistant capable of using external tools via MCP."
-    ),
-    tools=[data_initializer_mcp]
+    instruction=agent_instruction,
+    tools=[mcp_toolset, curaitor_toolset],
 )
