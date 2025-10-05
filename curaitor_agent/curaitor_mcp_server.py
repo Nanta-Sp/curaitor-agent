@@ -3,11 +3,12 @@
 # and extract information about specific papers. It uses the `arxiv` library to
 # Nanta, Shichuan
 # Sep 2025
+import asyncio
 import arxiv
 import json
 import os
 from typing import Iterable, List
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 # from arxiv_search_chunk import download_arxiv_pdfs
 # from arxiv_search_chunk import get_keywords_from_llm
 import yaml
@@ -687,7 +688,7 @@ def download_specific_papers(paper_urls: list[str], pdf_directory: str = None) -
 
 
 @mcp.tool()
-def ingest_local_pdfs(
+async def ingest_local_pdfs(
     pdf_directory: str = None,
     *,
     max_pdfs: int = 50,
@@ -698,6 +699,7 @@ def ingest_local_pdfs(
     chunk_overlap: Optional[int] = None,
     embedding_model: Optional[str] = None,
     embedding_prefix: Optional[str] = None,
+    context: Context | None = None,
 ) -> dict:
     """Parse PDFs from ``pdf_directory`` and store them in the SQLite cache."""
 
@@ -707,13 +709,20 @@ def ingest_local_pdfs(
         if not pdf_path.exists():
             return {"error": f"PDF directory {pdf_dir} does not exist", "database_path": str(DEFAULT_DB_PATH)}
 
-        parsed_docs = collect_documents_from_directory(
+        parsed_docs = await asyncio.to_thread(
+            collect_documents_from_directory,
             pdf_path,
             max_pdfs=max_pdfs,
             max_pages=max_pages,
             per_page_chars=per_page_chars,
             max_chars=max_chars,
         )
+        parsed_docs = list(parsed_docs)
+
+        if context:
+            await context.report_progress(
+                f"Discovered {len(parsed_docs)} document(s) in {pdf_dir}"
+            )
 
         if not parsed_docs:
             return {
@@ -723,13 +732,19 @@ def ingest_local_pdfs(
                 "message": f"No PDFs parsed from {pdf_dir}",
             }
 
-        stored_model, stored_prefix = _store_documents_with_defaults(
+        stored_model, stored_prefix = await asyncio.to_thread(
+            _store_documents_with_defaults,
             parsed_docs,
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             embedding_model=embedding_model,
             embedding_prefix=embedding_prefix,
         )
+
+        if context:
+            await context.report_progress(
+                f"Finished embedding {len(parsed_docs)} document(s)"
+            )
 
         return {
             "stored": len(parsed_docs),
