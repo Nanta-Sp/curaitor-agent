@@ -39,10 +39,13 @@ uv sync
     GMAIL_CREDENTIALS_PATH=
     GMAIL_TOKEN_PATH=secrets/token.json
     ```
-7) Initializer database
-``` bash
-uv run python ...
+7) Initialise the database
+```bash
+uv run python curaitor_agent/data_initializer.py --pdf-dir papers
 ```
+  - Replace `papers` with the folder containing your PDFs. The script respects
+    `config.yaml` defaults for chunking and embeddings, and accepts overrides
+    such as `--chunk-size 800 --chunk-overlap 80 --embedding-model sentence-transformers/all-MiniLM-L6-v2`.
 
 8) Run gmail authentication
 This will work for 1 hour.

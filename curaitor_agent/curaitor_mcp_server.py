@@ -25,7 +25,7 @@ from collections import defaultdict
 from io import BytesIO
 from mcp.server.fastmcp.prompts.base import Message
 from mcp.types import TextContent
-from gmail_send import gmail_send
+from gmail_send import AuthRequired, gmail_send
 import logging
 import numpy as np
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -42,6 +42,7 @@ from pdf_repository import (
     collect_documents_from_directory,
     embed_texts,
     fetch_document_chunks,
+    iter_document_texts,
     list_stored_documents,
     parse_pdf_file,
     store_documents,
@@ -79,28 +80,59 @@ def _as_int(value, default: int) -> int:
         return default
 
 
-def _store_documents_with_defaults(documents: Iterable) -> tuple[Optional[str], Optional[str]]:
+def _resolve_store_parameters(
+    *,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+    embedding_model: Optional[str] = None,
+    embedding_prefix: Optional[str] = None,
+) -> tuple[int, int, Optional[str], Optional[str]]:
+    """Combine explicit overrides with ``config.yaml`` defaults."""
+
+    default_chunk_size = _as_int(_get_config_value("rag", "chunk_size", 1000), 1000)
+    default_overlap = _as_int(_get_config_value("rag", "overlap", 100), 100)
+    default_model = _get_config_value("rag", "embedding_model", None)
+    default_prefix = _get_config_value("rag", "embedding_prefix", None)
+
+    chunk_size_val = chunk_size if chunk_size is not None else default_chunk_size
+    overlap_val = chunk_overlap if chunk_overlap is not None else default_overlap
+    model_val = embedding_model if embedding_model is not None else default_model
+    prefix_val = embedding_prefix if embedding_prefix is not None else default_prefix
+
+    if model_val and not prefix_val:
+        prefix_val = "search_document: "
+
+    return chunk_size_val, overlap_val, model_val, prefix_val if model_val else None
+
+
+def _store_documents_with_defaults(
+    documents: Iterable,
+    *,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+    embedding_model: Optional[str] = None,
+    embedding_prefix: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
     docs = list(documents)
     if not docs:
         return None, None
 
-    chunk_size = _as_int(_get_config_value("rag", "chunk_size", 1000), 1000)
-    chunk_overlap = _as_int(_get_config_value("rag", "overlap", 100), 100)
-    embedding_model_name = _get_config_value("rag", "embedding_model", None)
-    embedding_prefix = _get_config_value("rag", "embedding_prefix", None)
-
-    if embedding_prefix is None and embedding_model_name:
-        embedding_prefix = "search_document: "
+    chunk_size_val, overlap_val, model_val, prefix_val = _resolve_store_parameters(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        embedding_model=embedding_model,
+        embedding_prefix=embedding_prefix,
+    )
 
     store_documents(
         docs,
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        embedding_model=embedding_model_name,
-        embedding_prefix=embedding_prefix if embedding_model_name else None,
+        chunk_size=chunk_size_val,
+        chunk_overlap=overlap_val,
+        embedding_model=model_val,
+        embedding_prefix=prefix_val,
     )
 
-    return embedding_model_name, embedding_prefix if embedding_model_name else None
+    return model_val, prefix_val
 
 if provider == 'openrouter':
     api_key = os.getenv("OPENROUTER_API_KEY")
@@ -615,10 +647,10 @@ def search_arxiv_titles_only(
         return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
 @mcp.tool()
-def download_specific_papers(paper_urls: list[str]) -> dict:
+def download_specific_papers(paper_urls: list[str], pdf_directory: str = None) -> dict:
     """Download specific papers by PDF URL."""
     try:
-        pdf_dir = config['source'][0]['pdf_path']
+        pdf_dir = pdf_directory or config['source'][0]['pdf_path']
         os.makedirs(pdf_dir, exist_ok=True)
         
         downloaded = []
@@ -626,20 +658,344 @@ def download_specific_papers(paper_urls: list[str]) -> dict:
             try:
                 response = requests.get(url, timeout=30)
                 response.raise_for_status()
-                
+
                 pdf_filename = url.split("/")[-1] + '.pdf'
                 pdf_path = Path(pdf_dir) / pdf_filename
-                
+
                 with open(pdf_path, 'wb') as f:
                     f.write(response.content)
-                    
-                downloaded.append({"url": url, "filename": pdf_filename, "status": "success"})
-                
+
+                downloaded.append(
+                    {
+                        "url": url,
+                        "filename": pdf_filename,
+                        "path": str(pdf_path),
+                        "status": "success",
+                    }
+                )
+
             except Exception as e:
                 downloaded.append({"url": url, "status": "failed", "error": str(e)})
-                
-        return {"downloaded": downloaded, "success_count": sum(1 for d in downloaded if d["status"] == "success")}
-        
+
+        return {
+            "downloaded": downloaded,
+            "success_count": sum(1 for d in downloaded if d["status"] == "success"),
+        }
+
+    except Exception as e:
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
+
+
+@mcp.tool()
+def ingest_local_pdfs(
+    pdf_directory: str = None,
+    *,
+    max_pdfs: int = 50,
+    max_pages: int = 10,
+    per_page_chars: Optional[int] = None,
+    max_chars: Optional[int] = None,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+    embedding_model: Optional[str] = None,
+    embedding_prefix: Optional[str] = None,
+) -> dict:
+    """Parse PDFs from ``pdf_directory`` and store them in the SQLite cache."""
+
+    try:
+        pdf_dir = pdf_directory or config['source'][0]['pdf_path']
+        pdf_path = Path(pdf_dir)
+        if not pdf_path.exists():
+            return {"error": f"PDF directory {pdf_dir} does not exist", "database_path": str(DEFAULT_DB_PATH)}
+
+        parsed_docs = collect_documents_from_directory(
+            pdf_path,
+            max_pdfs=max_pdfs,
+            max_pages=max_pages,
+            per_page_chars=per_page_chars,
+            max_chars=max_chars,
+        )
+
+        if not parsed_docs:
+            return {
+                "stored": 0,
+                "documents": [],
+                "database_path": str(DEFAULT_DB_PATH),
+                "message": f"No PDFs parsed from {pdf_dir}",
+            }
+
+        stored_model, stored_prefix = _store_documents_with_defaults(
+            parsed_docs,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            embedding_model=embedding_model,
+            embedding_prefix=embedding_prefix,
+        )
+
+        return {
+            "stored": len(parsed_docs),
+            "documents": [doc.to_dict() for doc in parsed_docs],
+            "database_path": str(DEFAULT_DB_PATH),
+            "embedding_model": stored_model,
+            "embedding_prefix": stored_prefix,
+            "chunk_size": chunk_size or _as_int(_get_config_value("rag", "chunk_size", 1000), 1000),
+            "chunk_overlap": chunk_overlap or _as_int(_get_config_value("rag", "overlap", 100), 100),
+        }
+
+    except Exception as e:
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
+
+
+@mcp.tool()
+def refresh_arxiv_feed(
+    natural_language_query: str,
+    *,
+    max_results: int = 3,
+    pdf_directory: str = None,
+    notify_email: Optional[str] = None,
+    max_pages: int = 5,
+) -> dict:
+    """Search arXiv, download PDFs, store them, and optionally email a summary."""
+
+    try:
+        keywords = get_keywords_from_llm(natural_language_query) or []
+        if not keywords:
+            return {"error": "Keyword extraction failed", "keywords": [], "database_path": str(DEFAULT_DB_PATH)}
+
+        search_result = search_arxiv_titles_only(keywords, max_results=max_results)
+        if "error" in search_result:
+            return {
+                "error": search_result["error"],
+                "keywords": keywords,
+                "database_path": str(DEFAULT_DB_PATH),
+            }
+
+        pdf_urls = [paper["pdf_url"] for paper in search_result.get("papers", []) if paper.get("pdf_url")]
+        download_result = download_specific_papers(pdf_urls, pdf_directory=pdf_directory)
+        successful = [item for item in download_result.get("downloaded", []) if item.get("status") == "success" and item.get("path")]
+
+        parsed_docs = []
+        for item in successful:
+            doc = parse_pdf_file(Path(item["path"]), max_pages=max_pages)
+            if doc:
+                parsed_docs.append(doc)
+
+        stored_model, stored_prefix = _store_documents_with_defaults(parsed_docs)
+
+        email_status: Optional[dict[str, object]] = None
+        if notify_email:
+            summary_lines = [
+                f"- {paper['title']} ({paper['arxiv_id']})" for paper in search_result.get("papers", [])[:max_results]
+            ]
+            stored_count = len(parsed_docs)
+            subject = f"Curaitor feed refresh: {stored_count} stored"
+            body_lines = [
+                f"Query: {natural_language_query}",
+                f"Keywords: {', '.join(keywords[:5])}",
+                f"Downloaded: {download_result.get('success_count', 0)} / {len(pdf_urls)}",
+                f"Stored in DB: {stored_count}",
+                "",
+                "Top results:",
+            ] + summary_lines
+
+            try:
+                send_result = gmail_send(to=notify_email, subject=subject, body="\n".join(body_lines))
+            except AuthRequired as exc:
+                email_status = {
+                    "sent": False,
+                    "requires_auth": True,
+                    "auth_url": exc.auth_url,
+                    "error": getattr(exc, "original_message", str(exc)),
+                }
+            except Exception as exc:
+                email_status = {"sent": False, "error": str(exc)}
+            else:
+                email_status = {
+                    "sent": True,
+                    "message_id": send_result.get("id"),
+                    "thread_id": send_result.get("threadId"),
+                }
+
+        return {
+            "keywords": keywords,
+            "search": search_result,
+            "downloads": download_result,
+            "stored": [doc.to_dict() for doc in parsed_docs],
+            "stored_count": len(parsed_docs),
+            "embedding_model": stored_model,
+            "embedding_prefix": stored_prefix,
+            "database_path": str(DEFAULT_DB_PATH),
+            "email_status": email_status,
+        }
+
+    except Exception as e:
+        return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
+
+
+@mcp.tool()
+def chat_with_repository(
+    question: str,
+    *,
+    top_doc_limit: int = 3,
+    per_doc_limit: int = 2,
+    embedding_model: Optional[str] = None,
+    query_prefix: Optional[str] = None,
+) -> dict:
+    """Answer ``question`` using documents stored in the SQLite cache."""
+
+    try:
+        stored_docs = {doc["arxiv_id"]: doc for doc in list_stored_documents()}
+        if not stored_docs:
+            return {
+                "error": "No documents are stored in the repository yet.",
+                "database_path": str(DEFAULT_DB_PATH),
+            }
+
+        embedding_model_name = embedding_model or _get_config_value("rag", "embedding_model", None)
+        chunks = fetch_document_chunks(embedding_model=embedding_model_name)
+        if not chunks and embedding_model_name is None:
+            chunks = fetch_document_chunks()
+
+        if embedding_model_name is None:
+            for chunk in chunks:
+                if chunk.embedding_model:
+                    embedding_model_name = chunk.embedding_model
+                    break
+
+        prefix = query_prefix
+        if prefix is None:
+            prefix = _get_config_value("rag", "query_prefix", None)
+        query_text = f"{prefix}{question}" if prefix else question
+
+        chunk_hits: list[tuple[DocumentChunk, float]] = []
+        embedding_mode = False
+
+        if embedding_model_name:
+            vectors = []
+            references: list[DocumentChunk] = []
+            for chunk in chunks:
+                if chunk.embedding is None:
+                    continue
+                references.append(chunk)
+                vectors.append(np.asarray(chunk.embedding, dtype="float32"))
+
+            if vectors:
+                embedding_mode = True
+                dim = vectors[0].shape[0]
+                index = faiss.IndexFlatIP(dim)
+                index.add(np.vstack(vectors).astype("float32"))
+
+                query_vector = embed_texts([query_text], model_name=embedding_model_name)[0]
+                query_vector_np = np.asarray(query_vector, dtype="float32").reshape(1, dim)
+                search_k = min(len(references), max(top_doc_limit * per_doc_limit * 4, top_doc_limit))
+                distances, indices = index.search(query_vector_np, search_k)
+
+                for idx, score in zip(indices[0], distances[0]):
+                    if idx < 0 or idx >= len(references):
+                        continue
+                    chunk_hits.append((references[idx], float(score)))
+
+        relevant_papers: list[dict[str, object]] = []
+        context_parts: list[str] = []
+
+        if chunk_hits:
+            doc_hits: dict[str, list[tuple[DocumentChunk, float]]] = defaultdict(list)
+            for chunk, score in chunk_hits:
+                doc_hits[chunk.arxiv_id].append((chunk, score))
+
+            ranked_docs = sorted(
+                doc_hits.items(),
+                key=lambda item: max(score for _, score in item[1]),
+                reverse=True,
+            )
+
+            for doc_id, entries in ranked_docs[:top_doc_limit]:
+                entries.sort(key=lambda item: item[1], reverse=True)
+                metadata = stored_docs.get(doc_id, {})
+                chunk_details = []
+                best_score = 0.0
+
+                for chunk, score in entries[:per_doc_limit]:
+                    best_score = max(best_score, score)
+                    preview = chunk.text[:300] + "..." if len(chunk.text) > 300 else chunk.text
+                    chunk_details.append(
+                        {
+                            "chunk_index": chunk.chunk_index,
+                            "score": score,
+                            "start_char": chunk.start_char,
+                            "end_char": chunk.end_char,
+                            "text_preview": preview,
+                        }
+                    )
+
+                    snippet = chunk.text if len(chunk.text) <= 1200 else chunk.text[:1200] + "..."
+                    label = metadata.get("filename") or doc_id
+                    context_parts.append(
+                        f"[PDF: {label}] (chunk {chunk.chunk_index})\n{snippet}"
+                    )
+
+                relevant_papers.append(
+                    {
+                        "arxiv_id": doc_id,
+                        "filename": metadata.get("filename"),
+                        "path": metadata.get("path"),
+                        "relevance_score": best_score,
+                        "chunk_count": metadata.get("chunk_count"),
+                        "chunks": chunk_details,
+                        "pages_indexed": metadata.get("pages_processed"),
+                        "total_pages": metadata.get("total_pages"),
+                    }
+                )
+
+        if not context_parts:
+            keyword_terms = [term.lower() for term in question.split() if len(term) > 3]
+            fallback_scores: list[tuple[str, int, str]] = []
+            for arxiv_id, text in iter_document_texts():
+                lowered = text.lower()
+                score = sum(lowered.count(term) for term in keyword_terms) if keyword_terms else 0
+                if score:
+                    snippet = text[:800] + "..." if len(text) > 800 else text
+                    fallback_scores.append((arxiv_id, score, snippet))
+
+            fallback_scores.sort(key=lambda item: item[1], reverse=True)
+
+            for doc_id, score, snippet in fallback_scores[:top_doc_limit]:
+                metadata = stored_docs.get(doc_id, {})
+                label = metadata.get("filename") or doc_id
+                relevant_papers.append(
+                    {
+                        "arxiv_id": doc_id,
+                        "filename": metadata.get("filename"),
+                        "path": metadata.get("path"),
+                        "relevance_score": score,
+                        "chunk_count": metadata.get("chunk_count"),
+                    }
+                )
+                context_parts.append(f"[PDF: {label}]\n{snippet}")
+
+        if not context_parts:
+            return {
+                "answer": "No relevant information found in the stored documents.",
+                "relevant_papers": [],
+                "database_path": str(DEFAULT_DB_PATH),
+                "embedding_model": embedding_model_name,
+                "mode": "none",
+            }
+
+        context = "\n\n---\n\n".join(context_parts)
+        try:
+            answer = answer_query_with_context(question, context)
+        except Exception as exc:
+            answer = f"Could not generate answer: {exc}"
+
+        return {
+            "answer": answer,
+            "relevant_papers": relevant_papers,
+            "context_chunks": len(context_parts),
+            "database_path": str(DEFAULT_DB_PATH),
+            "embedding_model": embedding_model_name,
+            "mode": "embedding" if embedding_mode and chunk_hits else "keyword",
+        }
+
     except Exception as e:
         return {"error": str(e), "database_path": str(DEFAULT_DB_PATH)}
 
